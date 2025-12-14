@@ -95,16 +95,40 @@ export default {
   },
   methods: {
     onDropFiles (e) {
-      this.uploadFiles(e.dataTransfer.files)
+      const files = Array.from(e.dataTransfer.files).filter((f) => {
+        if (this.accept === 'image/*') {
+          return f.type.startsWith('image')
+        } else {
+          return true
+        }
+      })
+
+      if (this.accept === 'image/*' && !files.length) {
+        alert(this.t('please_upload_an_image_file'))
+      } else {
+        this.uploadFiles(files)
+      }
     },
     onSelectFiles (e) {
       e.preventDefault()
 
-      this.uploadFiles(this.$refs.input.files).then(() => {
-        if (this.$refs.input) {
-          this.$refs.input.value = ''
+      const files = Array.from(this.$refs.input.files).filter((f) => {
+        if (this.accept === 'image/*') {
+          return f.type.startsWith('image')
+        } else {
+          return true
         }
       })
+
+      if (this.accept === 'image/*' && !files.length) {
+        alert(this.t('please_upload_an_image_file'))
+      } else {
+        this.uploadFiles(files).then(() => {
+          if (this.$refs.input) {
+            this.$refs.input.value = ''
+          }
+        })
+      }
     },
     async uploadFiles (files) {
       this.isLoading = true
@@ -139,12 +163,20 @@ export default {
             return fetch(this.baseUrl + '/api/attachments', {
               method: 'POST',
               body: formData
-            }).then(resp => resp.json()).then((data) => {
-              return data
+            }).then(async (resp) => {
+              const data = await resp.json()
+
+              if (resp.status === 422) {
+                alert(data.error)
+              } else {
+                return data
+              }
             })
           }
         })).then((result) => {
-        this.$emit('upload', result)
+        if (result && result[0]) {
+          this.$emit('upload', result)
+        }
       }).finally(() => {
         this.isLoading = false
       })

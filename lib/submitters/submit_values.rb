@@ -6,7 +6,15 @@ module Submitters
     RequiredFieldError = Class.new(StandardError)
 
     VARIABLE_REGEXP = /\{\{?(\w+)\}\}?/
-    NONEDITABLE_FIELD_TYPES = %w[stamp heading].freeze
+    NONEDITABLE_FIELD_TYPES = %w[stamp heading strikethrough].freeze
+
+    STRFTIME_MAP = {
+      'hour' => '%-k',
+      'minute' => '%M',
+      'day' => '%-d',
+      'month' => '%-m',
+      'year' => '%Y'
+    }.freeze
 
     module_function
 
@@ -16,10 +24,7 @@ module Submitters
       unless submitter.submission_events.exists?(event_type: 'start_form')
         SubmissionEvents.create_with_tracking_data(submitter, 'start_form', request)
 
-        WebhookUrls.for_account_id(submitter.account_id, 'form.started').each do |webhook_url|
-          SendFormStartedWebhookRequestJob.perform_async('submitter_id' => submitter.id,
-                                                         'webhook_url_id' => webhook_url.id)
-        end
+        WebhookUrls.enqueue_events(submitter, 'form.started')
       end
 
       update_submitter!(submitter, params, request, validate_required:)
@@ -138,7 +143,7 @@ module Submitters
       end
     end
 
-    def merge_default_values(submitter)
+    def merge_default_values(submitter, with_verification: true)
       default_values = submitter.submission.template_fields.each_with_object({}) do |field, acc|
         next if field['submitter_uuid'] != submitter.uuid
 
@@ -152,7 +157,7 @@ module Submitters
           next
         end
 
-        if field['type'] == 'verification'
+        if field['type'] == 'verification' && with_verification
           acc[field['uuid']] =
             if submitter.submission_events.exists?(event_type: :complete_verification)
               I18n.t(:verified, locale: :en)
@@ -191,10 +196,30 @@ module Submitters
             submitter.values
           end
 
+        formula = normalize_formula(formula, submitter.submission, submission_values:)
+
         acc[field['uuid']] = calculate_formula_value(formula, submission_values.merge(acc.compact_blank))
       end
 
       computed_values.compact_blank
+    end
+
+    def normalize_formula(formula, submission, depth: 0, submission_values: nil)
+      raise ValidationError, 'Formula infinite loop' if depth > 10
+
+      formula.gsub(/{{(.*?)}}/) do |match|
+        uuid = Regexp.last_match(1)
+
+        if (nested_formula = submission.fields_uuid_index.dig(uuid, 'preferences', 'formula').presence)
+          if check_field_conditions(submission_values, submission.fields_uuid_index[uuid], submission.fields_uuid_index)
+            "(#{normalize_formula(nested_formula, submission, depth: depth + 1, submission_values:)})"
+          else
+            '0'
+          end
+        else
+          match
+        end
+      end
     end
 
     def calculate_formula_value(_formula, _values)
@@ -316,7 +341,7 @@ module Submitters
     end
 
     def replace_default_variables(value, attrs, submission, with_time: false)
-      return value if value.in?([true, false]) || value.is_a?(Numeric)
+      return value if value.in?([true, false]) || value.is_a?(Numeric) || value.is_a?(Array)
       return if value.blank?
 
       value.to_s.gsub(VARIABLE_REGEXP) do |e|
@@ -330,12 +355,10 @@ module Submitters
           else
             e
           end
+        when 'hour', 'minute', 'day', 'month', 'year'
+          with_time ? Time.current.in_time_zone(submission.account.timezone).strftime(STRFTIME_MAP[key]) : e
         when 'date'
-          if with_time
-            Time.current.in_time_zone(submission.account.timezone).to_date.to_s
-          else
-            e
-          end
+          with_time ? Time.current.in_time_zone(submission.account.timezone).to_date.to_s : e
         when 'role', 'email', 'phone', 'name'
           attrs[key] || e
         else

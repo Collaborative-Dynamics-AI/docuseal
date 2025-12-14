@@ -161,7 +161,6 @@ RSpec.describe 'Signing Form' do
       expect(field_value(submitter, 'Cell code')).to eq '123'
     end
 
-    # rubocop:disable RSpec/ExampleLength
     it 'completes the form when name, email, and phone are required' do
       template.update(preferences: { link_form_fields: %w[email name phone] })
 
@@ -250,7 +249,93 @@ RSpec.describe 'Signing Form' do
       expect(field_value(submitter, 'Attachment')).to be_present
       expect(field_value(submitter, 'Cell code')).to eq '123'
     end
-    # rubocop:enable RSpec/ExampleLength
+
+    it 'completes the form when identity verification with a 2FA code is enabled', sidekiq: :inline do
+      create(:encrypted_config, key: EncryptedConfig::ESIGN_CERTS_KEY,
+                                value: GenerateCertificate.call.transform_values(&:to_pem))
+
+      template.update(preferences: { link_form_fields: %w[email name], shared_link_2fa: true })
+
+      visit start_form_path(slug: template.slug)
+
+      fill_in 'Email', with: 'john.dou@example.com'
+      fill_in 'Name', with: 'John Doe'
+
+      expect do
+        click_button 'Start'
+      end.to change { ActionMailer::Base.deliveries.count }.by(1)
+
+      email = ActionMailer::Base.deliveries.last
+      code = email.body.encoded[%r{<b>(.*?)</b>}, 1]
+
+      fill_in 'one_time_code', with: code
+
+      click_button 'Submit'
+
+      fill_in 'First Name', with: 'John'
+      click_button 'next'
+
+      fill_in 'Birthday', with: I18n.l(20.years.ago, format: '%Y-%m-%d')
+      click_button 'next'
+
+      check 'Do you agree?'
+      click_button 'next'
+
+      choose 'Boy'
+      click_button 'next'
+
+      draw_canvas
+      click_button 'next'
+
+      fill_in 'House number', with: '123'
+      click_button 'next'
+
+      %w[Red Blue].each { |color| check color }
+      click_button 'next'
+
+      select 'Male', from: 'Gender'
+      click_button 'next'
+
+      draw_canvas
+      click_button 'next'
+
+      find('#dropzone').click
+      find('input[type="file"]', visible: false).attach_file(Rails.root.join('spec/fixtures/sample-image.png'))
+      click_button 'next'
+
+      find('#dropzone').click
+      find('input[type="file"]', visible: false).attach_file(Rails.root.join('spec/fixtures/sample-document.pdf'))
+      click_button 'next'
+
+      fill_in 'Cell code', with: '123'
+      click_on 'Complete'
+
+      expect(page).to have_button('Download')
+      expect(page).to have_content('Document has been signed!')
+
+      submitter = template.submissions.last.submitters.last
+
+      expect(submitter.email).to eq('john.dou@example.com')
+      expect(submitter.name).to eq('John Doe')
+      expect(submitter.ip).to eq('127.0.0.1')
+      expect(submitter.ua).to be_present
+      expect(submitter.opened_at).to be_present
+      expect(submitter.completed_at).to be_present
+      expect(submitter.declined_at).to be_nil
+
+      expect(field_value(submitter, 'First Name')).to eq 'John'
+      expect(field_value(submitter, 'Birthday')).to eq 20.years.ago.strftime('%Y-%m-%d')
+      expect(field_value(submitter, 'Do you agree?')).to be_truthy
+      expect(field_value(submitter, 'First child')).to eq 'Boy'
+      expect(field_value(submitter, 'Signature')).to be_present
+      expect(field_value(submitter, 'House number')).to eq 123
+      expect(field_value(submitter, 'Colors')).to contain_exactly('Red', 'Blue')
+      expect(field_value(submitter, 'Gender')).to eq 'Male'
+      expect(field_value(submitter, 'Initials')).to be_present
+      expect(field_value(submitter, 'Avatar')).to be_present
+      expect(field_value(submitter, 'Attachment')).to be_present
+      expect(field_value(submitter, 'Cell code')).to eq '123'
+    end
   end
 
   context 'when the submitter form link is opened' do
@@ -1026,20 +1111,95 @@ RSpec.describe 'Signing Form' do
     end
   end
 
-  it 'sends completed email' do
-    template = create(:template, account:, author:, only_field_types: %w[text signature])
-    submission = create(:submission, template:)
-    submitter = create(:submitter, submission:, uuid: template.submitters.first['uuid'], account:)
+  context 'when a form is completed' do
+    let(:template) { create(:template, account:, author:, only_field_types: %w[text signature]) }
+    let(:submission) { create(:submission, template:) }
+    let(:submitter) { create(:submitter, submission:, uuid: template.submitters.first['uuid'], account:) }
 
-    visit submit_form_path(slug: submitter.slug)
+    before do
+      visit submit_form_path(slug: submitter.slug)
+    end
 
-    fill_in 'First Name', with: 'Adam'
-    click_on 'next'
-    click_link 'Type'
-    fill_in 'signature_text_input', with: 'Adam'
+    it 'sends completed email' do
+      fill_in 'First Name', with: 'Adam'
+      click_on 'next'
+      draw_canvas
 
-    expect do
-      click_on 'Sign and Complete'
-    end.to change(ProcessSubmitterCompletionJob.jobs, :size).by(1)
+      expect do
+        click_on 'Sign and Complete'
+      end.to change(ProcessSubmitterCompletionJob.jobs, :size).by(1)
+    end
+  end
+
+  context 'when the 2FA email verification is enabled', sidekiq: :inline do
+    let(:template) { create(:template, account:, author:, only_field_types: %w[text]) }
+    let(:submission) { create(:submission, template:) }
+    let(:submitter) do
+      create(:submitter, submission:, uuid: template.submitters.first['uuid'], account:)
+    end
+
+    before do
+      template.update(preferences: { require_email_2fa: true })
+      create(:encrypted_config, key: EncryptedConfig::ESIGN_CERTS_KEY,
+                                value: GenerateCertificate.call.transform_values(&:to_pem))
+    end
+
+    it 'completes the form if the one-time password is filled correctly' do
+      visit submit_form_path(slug: submitter.slug)
+
+      click_button 'Send verification code'
+
+      email = ActionMailer::Base.deliveries.last
+      one_time_code = email.body.encoded[%r{<b>(\d{6})</b>}, 1]
+
+      fill_in 'one_time_code', with: one_time_code
+
+      click_button 'Submit'
+
+      fill_in 'First Name', with: 'Mary'
+      click_button 'Complete'
+
+      expect(page).to have_content('Form has been completed!')
+
+      submitter.reload
+
+      expect(submitter.completed_at).to be_present
+      expect(field_value(submitter, 'First Name')).to eq 'Mary'
+    end
+
+    it "doesn't complete the form if the one-time code is invalid" do
+      visit submit_form_path(slug: submitter.slug)
+
+      click_button 'Send verification code'
+      fill_in 'one_time_code', with: '123456'
+      click_button 'Submit'
+
+      expect(page).to have_content 'Invalid code'
+    end
+
+    it 'completes the form after resending the one time code' do
+      visit submit_form_path(slug: submitter.slug)
+
+      click_button 'Send verification code'
+
+      find('#resend_label').click
+
+      email = ActionMailer::Base.deliveries.last
+      one_time_code = email.body.encoded[%r{<b>(\d{6})</b>}, 1]
+
+      fill_in 'one_time_code', with: one_time_code
+
+      click_button 'Submit'
+
+      fill_in 'First Name', with: 'Mary'
+      click_button 'Complete'
+
+      expect(page).to have_content('Form has been completed!')
+
+      submitter.reload
+
+      expect(submitter.completed_at).to be_present
+      expect(field_value(submitter, 'First Name')).to eq 'Mary'
+    end
   end
 end

@@ -10,10 +10,21 @@ module Api
     def create
       submitter = Submitter.find_by!(slug: params[:submitter_slug])
 
-      if params[:type].in?(%w[initials signature]) && ImageUtils.blank?(Vips::Image.new_from_file(params[:file].path))
-        Rollbar.error("Empty signature: #{submitter.id}") if defined?(Rollbar)
+      if params[:type].in?(%w[initials signature])
+        image = Vips::Image.new_from_file(params[:file].path)
 
-        return render json: { error: "#{params[:type]} is empty" }, status: :unprocessable_entity
+        if ImageUtils.blank?(image)
+          Rollbar.error("Empty signature: #{submitter.id}") if defined?(Rollbar)
+
+          return render json: { error: "#{params[:type]} is empty" }, status: :unprocessable_content
+        end
+
+        if ImageUtils.error?(image)
+          Rollbar.error("Error signature: #{submitter.id}") if defined?(Rollbar)
+
+          return render json: { error: "#{params[:type]} error, try to sign on another device" },
+                        status: :unprocessable_content
+        end
       end
 
       attachment = Submitters.create_attachment!(submitter, params)
@@ -23,6 +34,10 @@ module Api
       end
 
       render json: attachment.as_json(only: %i[uuid created_at], methods: %i[url filename content_type])
+    rescue Submitters::MaliciousFileExtension => e
+      Rollbar.error(e) if defined?(Rollbar)
+
+      render json: { error: e.message }, status: :unprocessable_content
     end
 
     def build_new_cookie_signatures_json(submitter, attachment)

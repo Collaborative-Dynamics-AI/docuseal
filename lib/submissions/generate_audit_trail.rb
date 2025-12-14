@@ -23,6 +23,8 @@ module Submissions
     RTL_REGEXP = TextUtils::RTL_REGEXP
     MAX_IMAGE_HEIGHT = 100
 
+    CHECKSUM_LIMIT = 30
+
     US_TIMEZONES = TimeUtils::US_TIMEZONES
 
     module_function
@@ -81,7 +83,12 @@ module Submissions
         end
 
       composer = HexaPDF::Composer.new(skip_page_creation: true)
-      composer.document.task(:pdfa) if FONT_NAME == 'GoNotoKurrent'
+
+      if Docuseal.pdf_format == 'pdf/a-3b'
+        composer.document.task(:pdfa, level: '3b')
+      elsif FONT_NAME == 'GoNotoKurrent'
+        composer.document.task(:pdfa)
+      end
 
       composer.document.config['font.map'] = {
         'Helvetica' => {
@@ -108,17 +115,18 @@ module Submissions
 
       configs = submission.account.account_configs.where(key: [AccountConfig::WITH_AUDIT_VALUES_KEY,
                                                                AccountConfig::WITH_SIGNATURE_ID,
-                                                               AccountConfig::WITH_AUDIT_SUBMITTER_TIMEZONE_KEY])
+                                                               AccountConfig::WITH_FILE_LINKS_KEY,
+                                                               AccountConfig::WITH_SUBMITTER_TIMEZONE_KEY])
 
       last_submitter = submission.submitters.select(&:completed_at).max_by(&:completed_at)
 
       with_signature_id = configs.find { |c| c.key == AccountConfig::WITH_SIGNATURE_ID }&.value == true
+      with_file_links = configs.find { |c| c.key == AccountConfig::WITH_FILE_LINKS_KEY }&.value == true
       with_audit_values = configs.find { |c| c.key == AccountConfig::WITH_AUDIT_VALUES_KEY }&.value != false
-      with_audit_submitter_timezone =
-        configs.find { |c| c.key == AccountConfig::WITH_AUDIT_SUBMITTER_TIMEZONE_KEY }&.value == true
+      with_submitter_timezone = configs.find { |c| c.key == AccountConfig::WITH_SUBMITTER_TIMEZONE_KEY }&.value == true
 
       timezone = account.timezone
-      timezone = last_submitter.timezone || account.timezone if with_audit_submitter_timezone
+      timezone = last_submitter.timezone || account.timezone if with_submitter_timezone
 
       composer.page_style(:default, page_size:) do |canvas, style|
         box = canvas.context.box(:media)
@@ -192,7 +200,7 @@ module Submissions
 
       composer.draw_box(divider)
 
-      documents_data = Submitters.select_attachments_for_download(last_submitter).map do |document|
+      documents_data = select_attachments(last_submitter).map do |document|
         original_documents = submission.schema_documents.select do |e|
           e.uuid == (document.metadata['original_uuid'] || document.uuid)
         end.presence
@@ -210,7 +218,7 @@ module Submissions
           composer.document.layout.formatted_text_box(
             [
               { text: "#{I18n.t('original_sha256')}:\n", font: [FONT_NAME, { variant: :bold }] },
-              original_documents.map { |d| d.metadata['sha256'] || d.checksum }.join("\n"),
+              original_documents.map { |d| d.metadata['sha256'] || d.checksum }.first(CHECKSUM_LIMIT).join("\n"),
               "\n",
               { text: "#{I18n.t('result_sha256')}:\n", font: [FONT_NAME, { variant: :bold }] },
               document.metadata['sha256'] || document.checksum,
@@ -240,17 +248,22 @@ module Submissions
 
         click_email_event =
           submission.submission_events.find { |e| e.submitter_id == submitter.id && e.click_email? }
+
+        verify_email_event =
+          submission.submission_events.find { |e| e.submitter_id == submitter.id && e.email_verified? }
+
         is_phone_verified =
           submission.template_fields.any? do |e|
             e['type'] == 'phone' && e['submitter_uuid'] == submitter.uuid && submitter.values[e['uuid']].present?
           end
 
+        verify_phone_event =
+          submission.submission_events.find { |e| e.submitter_id == submitter.id && e.phone_verified? }
+
         is_id_verified =
           submission.template_fields.any? do |e|
             e['type'] == 'verification' && e['submitter_uuid'] == submitter.uuid && submitter.values[e['uuid']].present?
           end
-
-        submitter_field_counters = Hash.new { 0 }
 
         info_rows = [
           [
@@ -266,10 +279,10 @@ module Submissions
           [
             composer.document.layout.formatted_text_box(
               [
-                submitter.email && click_email_event && {
+                submitter.email && (click_email_event || verify_email_event) && {
                   text: "#{I18n.t('email_verification')}: #{I18n.t('verified')}\n"
                 },
-                submitter.phone && is_phone_verified && {
+                submitter.phone && (is_phone_verified || verify_phone_event) && {
                   text: "#{I18n.t('phone_verification')}: #{I18n.t('verified')}\n"
                 },
                 is_id_verified && {
@@ -287,25 +300,53 @@ module Submissions
 
         composer.table(info_rows, cell_style: { padding: [0, 0, 0, 0], border: { width: 0 } })
 
-        submission.template_fields.filter_map do |field|
-          next if field['submitter_uuid'] != submitter.uuid
-          next if field['type'] == 'heading'
-          next if !with_audit_values && !field['type'].in?(%w[signature initials])
+        submitter_field_counters = Hash.new { 0 }
+        grouped_value_field_names = {}
+        skip_grouped_field_uuids = {}
+
+        submission.template_fields.each do |field|
+          next unless field['type'].in?(%w[signature initials])
 
           submitter_field_counters[field['type']] += 1
+
+          next if field['submitter_uuid'] != submitter.uuid
+
+          value = submitter.values[field['uuid']]
+
+          field_name = field['title'].presence || field['name'].presence ||
+                       "#{I18n.t("#{field['type']}_field")} #{submitter_field_counters[field['type']]}"
+
+          if grouped_value_field_names[value]
+            skip_grouped_field_uuids[field['uuid']] = true
+
+            grouped_value_field_names[value] += ", #{field_name}"
+          else
+            grouped_value_field_names[value] = field_name
+          end
+        end
+
+        submitter_field_counters = Hash.new { 0 }
+
+        submission.template_fields.filter_map do |field|
+          submitter_field_counters[field['type']] += 1
+
+          next if field['submitter_uuid'] != submitter.uuid
+          next if field['type'] == 'heading' || field['type'] == 'strikethrough'
+          next if !with_audit_values && !field['type'].in?(%w[signature initials])
+          next if skip_grouped_field_uuids[field['uuid']]
 
           value = submitter.values[field['uuid']]
 
           next if Array.wrap(value).compact_blank.blank?
 
-          field_name = field['title'].presence || field['name'].to_s
+          field_name = grouped_value_field_names[value].presence || field['title'].presence || field['name'].to_s
 
           [
             composer.formatted_text_box(
               [
                 {
                   text: TextUtils.maybe_rtl_reverse(field_name).upcase.presence ||
-                        "#{I18n.t("#{field['type']}_field")} #{submitter_field_counters[field['type']]}\n".upcase,
+                        "#{I18n.t("#{field['type']}_field")} #{submitter_field_counters[field['type']]}".upcase,
                   font_size: 6
                 }
               ].compact_blank,
@@ -354,8 +395,13 @@ module Submissions
               composer.formatted_text_box(
                 Array.wrap(value).map do |uuid|
                   attachment = submitter.attachments.find { |a| a.uuid == uuid }
+
                   link =
-                    ActiveStorage::Blob.proxy_url(attachment.blob)
+                    if with_file_links
+                      ActiveStorage::Blob.proxy_url(attachment.blob)
+                    else
+                      r.submissions_preview_url(submission.slug, **Docuseal.default_url_options)
+                    end
 
                   { link:, text: "#{attachment.filename}\n", style: :link }
                 end,
@@ -435,6 +481,16 @@ module Submissions
       'Signed with DocuSeal.com'
     end
 
+    def select_attachments(submitter)
+      original_documents = submitter.submission.schema_documents.preload(:blob)
+      is_more_than_two_images = original_documents.many?(&:image?)
+
+      submitter.documents.preload(:blob).reject do |attachment|
+        is_more_than_two_images &&
+          original_documents.find { |a| a.uuid == (attachment.metadata['original_uuid'] || attachment.uuid) }&.image?
+      end
+    end
+
     def maybe_add_background(_canvas, _submission, _page_size); end
 
     def show_verify?(submission)
@@ -451,6 +507,10 @@ module Submissions
                             width: 100,
                             padding: [5, 0, 0, 8],
                             position: :float, text_align: :left)
+    end
+
+    def r
+      Rails.application.routes.url_helpers
     end
     # rubocop:enable Metrics
   end

@@ -8,12 +8,14 @@ class TemplatesDashboardController < ApplicationController
   TEMPLATES_PER_PAGE = 12
   FOLDERS_PER_PAGE = 18
 
+  helper_method :selected_order
+
   def index
-    @template_folders = @template_folders.where(id: @templates.active.select(:folder_id))
+    @template_folders =
+      TemplateFolders.filter_active_folders(@template_folders.where(parent_folder_id: nil), @templates)
 
     @template_folders = TemplateFolders.search(@template_folders, params[:q])
-    @template_folders = sort_template_folders(@template_folders, current_user,
-                                              cookies.permanent[:dashboard_templates_order])
+    @template_folders = TemplateFolders.sort(@template_folders, current_user, selected_order)
 
     @pagy, @template_folders = pagy(
       @template_folders,
@@ -26,7 +28,7 @@ class TemplatesDashboardController < ApplicationController
     else
       @template_folders = @template_folders.reject { |e| e.name == TemplateFolder::DEFAULT_NAME }
       @templates = filter_templates(@templates).preload(:author, :template_accesses)
-      @templates = Templates::Order.call(@templates, current_user, cookies.permanent[:dashboard_templates_order])
+      @templates = Templates::Order.call(@templates, current_user, selected_order)
 
       limit =
         if @template_folders.size < 4
@@ -56,7 +58,7 @@ class TemplatesDashboardController < ApplicationController
         rel = Template.where(
           Template.arel_table[:id].in(
             rel.where(folder_id: current_account.default_template_folder.id).select(:id).arel
-               .union(shared_template_ids.arel)
+               .union(:all, shared_template_ids.arel)
           )
         )
       else
@@ -67,38 +69,14 @@ class TemplatesDashboardController < ApplicationController
     Templates.search(current_user, rel, params[:q])
   end
 
-  def sort_template_folders(template_folders, current_user, order)
-    case order
-    when 'used_at'
-      subquery =
-        Template.left_joins(:submissions)
-                .group(:folder_id)
-                .where(account_id: current_user.account_id)
-                .select(
-                  :folder_id,
-                  Template.arel_table[:updated_at].maximum.as('updated_at_max'),
-                  Submission.arel_table[:created_at].maximum.as('submission_created_at_max')
-                )
-
-      template_folders = template_folders.joins(
-        Template.arel_table
-                .join(subquery.arel.as('templates'), Arel::Nodes::OuterJoin)
-                .on(TemplateFolder.arel_table[:id].eq(Template.arel_table[:folder_id]))
-                .join_sources
-      )
-
-      template_folders.order(
-        Arel::Nodes::Case.new
-                         .when(Template.arel_table[:submission_created_at_max].gt(Template.arel_table[:updated_at_max]))
-                         .then(Template.arel_table[:submission_created_at_max])
-                         .else(Template.arel_table[:updated_at_max])
-                         .desc
-      )
-    when 'name'
-      template_folders.order(name: :asc)
-    else
-      template_folders.order(id: :desc)
-    end
+  def selected_order
+    @selected_order ||=
+      if cookies.permanent[:dashboard_templates_order].blank? ||
+         (cookies.permanent[:dashboard_templates_order] == 'used_at' && can?(:manage, :countless))
+        'created_at'
+      else
+        cookies.permanent[:dashboard_templates_order]
+      end
   end
 
   def load_related_submissions

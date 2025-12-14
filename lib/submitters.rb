@@ -11,6 +11,20 @@ module Submitters
     'values' => 'D'
   }.freeze
 
+  UnableToSendCode = Class.new(StandardError)
+  InvalidOtp = Class.new(StandardError)
+  MaliciousFileExtension = Class.new(StandardError)
+
+  DANGEROUS_EXTENSIONS = Set.new(%w[
+    exe com bat cmd scr pif vbs vbe js jse wsf wsh msi msp
+    hta cpl jar app deb rpm dmg pkg mpkg dll so dylib sys
+    inf reg ps1 psm1 psd1 ps1xml psc1 pssc bat cmd vb vba
+    sh bash zsh fish run out bin elf gadget workflow lnk scf
+    url desktop application action workflow apk ipa xap appx
+    appxbundle msix msixbundle diagcab diagpkg cpl msc ocx
+    drv scr ins isp mst paf prf shb shs slk ws wsc inf1 inf2
+  ].freeze)
+
   module_function
 
   def search(current_user, submitters, keyword)
@@ -53,7 +67,7 @@ module Submitters
           end
 
         [sql, number, weight, number.length > 1 ? number.delete_prefix('0') : number, weight]
-      elsif keyword.match?(/[^\p{L}\d&@.\-]/)
+      elsif keyword.match?(/[^\p{L}\d&@.-]/) || keyword.match?(/[.-]{2,}/)
         terms = TextUtils.transliterate(keyword.downcase).split(/\b/).map(&:squish).compact_blank.uniq
 
         if terms.size > 1
@@ -91,12 +105,13 @@ module Submitters
   def select_attachments_for_download(submitter)
     if AccountConfig.exists?(account_id: submitter.submission.account_id,
                              key: AccountConfig::COMBINE_PDF_RESULT_KEY,
-                             value: true) && submitter.submission.combined_document_attachment
-      return [submitter.submission.combined_document_attachment]
+                             value: true) &&
+       submitter.submission.submitters.all?(&:completed_at?)
+      return [submitter.submission.combined_document_attachment || Submissions::EnsureCombinedGenerated.call(submitter)]
     end
 
     original_documents = submitter.submission.schema_documents.preload(:blob)
-    is_more_than_two_images = original_documents.count(&:image?) > 1
+    is_more_than_two_images = original_documents.many?(&:image?)
 
     submitter.documents.preload(:blob).reject do |attachment|
       is_more_than_two_images &&
@@ -107,6 +122,12 @@ module Submitters
   def create_attachment!(submitter, params)
     blob =
       if (file = params[:file])
+        extension = File.extname(file.original_filename).delete_prefix('.').downcase
+
+        if DANGEROUS_EXTENSIONS.include?(extension)
+          raise MaliciousFileExtension, "File type '.#{extension}' is not allowed."
+        end
+
         ActiveStorage::Blob.create_and_upload!(io: file.open,
                                                filename: file.original_filename,
                                                content_type: file.content_type)
@@ -159,12 +180,25 @@ module Submitters
   end
 
   def current_submitter_order?(submitter)
-    submitter_items = submitter.submission.template_submitters || submitter.submission.template.submitters
+    submission = submitter.submission
 
-    before_items = submitter_items[0...(submitter_items.find_index { |e| e['uuid'] == submitter.uuid })]
+    submitter_items = submission.template_submitters || submission.template.submitters
 
-    before_items.reduce(true) do |acc, item|
-      acc && submitter.submission.submitters.find { |e| e.uuid == item['uuid'] }&.completed_at?
+    before_items =
+      if submitter_items.any? { |s| s['order'] }
+        submitter_groups = submitter_items.group_by.with_index { |s, index| s['order'] || index }.sort_by(&:first)
+
+        current_group_index = submitter_groups.find_index { |_, group| group.any? { |s| s['uuid'] == submitter.uuid } }
+
+        submitter_groups.first(current_group_index).flat_map(&:last)
+      else
+        submitter_items.first(submitter_items.find_index { |e| e['uuid'] == submitter.uuid })
+      end
+
+    before_items.all? do |item|
+      submitter = submission.submitters.find { |e| e.uuid == item['uuid'] }
+
+      submitter.nil? || submitter.completed_at?
     end
   end
 
@@ -193,5 +227,44 @@ module Submitters
     )
 
     "#{filename}.#{blob.filename.extension}"
+  end
+
+  def send_shared_link_email_verification_code(submitter, request:)
+    RateLimit.call("send-otp-code-#{request.remote_ip}", limit: 2, ttl: 45.seconds, enabled: true)
+
+    TemplateMailer.otp_verification_email(submitter.submission.template, email: submitter.email).deliver_later!
+  rescue RateLimit::LimitApproached
+    Rollbar.warning("Limit verification code for template: #{submitter.submission.template.id}") if defined?(Rollbar)
+
+    raise UnableToSendCode, I18n.t('too_many_attempts')
+  end
+
+  def verify_link_otp!(otp, submitter)
+    return false if otp.blank?
+
+    RateLimit.call("verify-2fa-code-#{Digest::MD5.base64digest(submitter.email)}",
+                   limit: 2, ttl: 45.seconds, enabled: true)
+
+    link_2fa_key = [submitter.email.downcase.squish, submitter.submission.template.slug].join(':')
+
+    raise InvalidOtp, I18n.t(:invalid_code) unless EmailVerificationCodes.verify(otp, link_2fa_key)
+
+    true
+  end
+
+  def populate_completed_is_first
+    Account.find_each do |account|
+      submissions_index = {}
+
+      CompletedSubmitter.where(account_id: account.id).order(:account_id, :completed_at).each do |cs|
+        submissions_index[cs.submission_id] ||= cs.submitter_id
+
+        cs.update_columns(is_first: submissions_index[cs.submission_id] == cs.submitter_id)
+      rescue ActiveRecord::RecordNotUnique
+        CompletedSubmitter.where(submission_id: cs.submission_id).update_all(is_first: false)
+
+        cs.update_columns(is_first: submissions_index[cs.submission_id] == cs.submitter_id)
+      end
+    end
   end
 end

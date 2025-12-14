@@ -78,7 +78,7 @@ module Docuseal
 
     @fulltext_search =
       if SearchEntry.table_exists?
-        Docuseal.multitenant? ? true : AccountConfig.exists?(key: :fulltext_search, value: true)
+        Docuseal.multitenant? || AccountConfig.exists?(key: :fulltext_search, value: true)
       else
         false
       end
@@ -86,6 +86,10 @@ module Docuseal
 
   def enable_pwa?
     true
+  end
+
+  def pdf_format
+    @pdf_format ||= ENV['PDF_FORMAT'].to_s.downcase
   end
 
   def trusted_certs

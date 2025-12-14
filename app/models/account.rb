@@ -33,6 +33,7 @@ class Account < ApplicationRecord
   has_many :account_linked_accounts, dependent: :destroy
   has_many :email_events, dependent: :destroy
   has_many :webhook_urls, dependent: :destroy
+  has_many :webhook_events, dependent: nil
   has_many :account_accesses, dependent: :destroy
   has_many :account_testing_accounts, -> { testing }, dependent: :destroy,
                                                       class_name: 'AccountLinkedAccount',
@@ -57,6 +58,10 @@ class Account < ApplicationRecord
 
   def testing?
     linked_account_account&.testing?
+  end
+
+  def tz_info
+    @tz_info ||= TZInfo::Timezone.get(ActiveSupport::TimeZone::MAPPING[timezone] || timezone)
   end
 
   def default_template_folder

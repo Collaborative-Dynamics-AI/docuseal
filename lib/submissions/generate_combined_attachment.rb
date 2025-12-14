@@ -17,6 +17,11 @@ module Submissions
 
       pdf.trailer.info[:Creator] = "#{Docuseal.product_name} (#{Docuseal::PRODUCT_URL})"
 
+      if Docuseal.pdf_format == 'pdf/a-3b'
+        pdf.task(:pdfa, level: '3b')
+        pdf.config['font.map'] = GenerateResultAttachments::PDFA_FONT_MAP
+      end
+
       if pkcs
         sign_params = {
           reason: Submissions::GenerateResultAttachments.single_sign_reason(submitter),
@@ -41,7 +46,7 @@ module Submissions
 
     def sign_pdf(io, pdf, sign_params)
       pdf.sign(io, **sign_params)
-    rescue HexaPDF::MalformedPDFError => e
+    rescue HexaPDF::MalformedPDFError, NoMethodError => e
       Rollbar.error(e) if defined?(Rollbar)
 
       pdf.sign(io, write_options: { incremental: false }, **sign_params)

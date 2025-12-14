@@ -22,6 +22,7 @@
 #
 class AccountConfig < ApplicationRecord
   SUBMITTER_INVITATION_EMAIL_KEY = 'submitter_invitation_email'
+  SUBMITTER_INVITATION_REMINDER_EMAIL_KEY = 'submitter_invitation_reminder_email'
   SUBMITTER_COMPLETED_EMAIL_KEY = 'submitter_completed_email'
   SUBMITTER_DOCUMENTS_COPY_EMAIL_KEY = 'submitter_documents_copy_email'
   BCC_EMAILS = 'bcc_emails'
@@ -38,11 +39,14 @@ class AccountConfig < ApplicationRecord
   FORM_PREFILL_SIGNATURE_KEY = 'form_prefill_signature'
   ESIGNING_PREFERENCE_KEY = 'esigning_preference'
   DOWNLOAD_LINKS_AUTH_KEY = 'download_links_auth'
+  DOWNLOAD_LINKS_EXPIRE_KEY = 'download_links_expire'
   FORCE_SSO_AUTH_KEY = 'force_sso_auth'
   FLATTEN_RESULT_PDF_KEY = 'flatten_result_pdf'
   WITH_SIGNATURE_ID = 'with_signature_id'
+  WITH_FILE_LINKS_KEY = 'with_file_links'
+  WITH_SIGNATURE_ID_REASON_KEY = 'with_signature_id_reason'
   WITH_AUDIT_VALUES_KEY = 'with_audit_values'
-  WITH_AUDIT_SUBMITTER_TIMEZONE_KEY = 'with_audit_submitter_timezone'
+  WITH_SUBMITTER_TIMEZONE_KEY = 'with_submitter_timezone'
   REQUIRE_SIGNING_REASON_KEY = 'require_signing_reason'
   REUSE_SIGNATURE_KEY = 'reuse_signature'
   COMBINE_PDF_RESULT_KEY = 'combine_pdf_result_key'
@@ -51,6 +55,12 @@ class AccountConfig < ApplicationRecord
 
   DEFAULT_VALUES = {
     SUBMITTER_INVITATION_EMAIL_KEY => lambda {
+      {
+        'subject' => I18n.t(:you_are_invited_to_sign_a_document),
+        'body' => I18n.t(:submitter_invitation_email_sign_body)
+      }
+    },
+    SUBMITTER_INVITATION_REMINDER_EMAIL_KEY => lambda {
       {
         'subject' => I18n.t(:you_are_invited_to_sign_a_document),
         'body' => I18n.t(:submitter_invitation_email_sign_body)

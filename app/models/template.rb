@@ -4,22 +4,23 @@
 #
 # Table name: templates
 #
-#  id          :bigint           not null, primary key
-#  archived_at :datetime
-#  fields      :text             not null
-#  name        :string           not null
-#  preferences :text             not null
-#  schema      :text             not null
-#  shared_link :boolean          default(FALSE), not null
-#  slug        :string           not null
-#  source      :text             not null
-#  submitters  :text             not null
-#  created_at  :datetime         not null
-#  updated_at  :datetime         not null
-#  account_id  :bigint           not null
-#  author_id   :bigint           not null
-#  external_id :string
-#  folder_id   :bigint           not null
+#  id               :bigint           not null, primary key
+#  archived_at      :datetime
+#  fields           :text             not null
+#  name             :string           not null
+#  preferences      :text             not null
+#  schema           :text             not null
+#  shared_link      :boolean          default(FALSE), not null
+#  slug             :string           not null
+#  source           :text             not null
+#  submitters       :text             not null
+#  variables_schema :text
+#  created_at       :datetime         not null
+#  updated_at       :datetime         not null
+#  account_id       :bigint           not null
+#  author_id        :bigint           not null
+#  external_id      :string
+#  folder_id        :bigint           not null
 #
 # Indexes
 #
@@ -57,6 +58,7 @@ class Template < ApplicationRecord
 
   serialize :preferences, coder: JSON
   serialize :fields, coder: JSON
+  serialize :variables_schema, coder: JSON
   serialize :schema, coder: JSON
   serialize :submitters, coder: JSON
 
@@ -72,10 +74,12 @@ class Template < ApplicationRecord
   scope :active, -> { where(archived_at: nil) }
   scope :archived, -> { where.not(archived_at: nil) }
 
-  delegate :name, to: :folder, prefix: true
-
   def application_key
     external_id
+  end
+
+  def folder_name
+    folder.full_name
   end
 
   private
